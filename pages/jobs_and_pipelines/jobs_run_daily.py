@@ -1,10 +1,12 @@
 import datetime as dt
+import json
+import os
 
 import altair as alt
 import pandas as pd
 import pytz
 import streamlit as st
-from databricks.sdk.service.jobs import RunType
+from databricks.sdk.service.sql import Disposition, Format, StatementState
 from pages.utils import make_workspace_client, COMMON_TZ, match_team_rules
 from pages.settings.storage import get_cached_settings, get_cached_user_prefs
 
@@ -15,6 +17,14 @@ _settings = get_cached_settings(_w_settings)
 _global_tz = _settings["timezone"]
 _teams_cfg = _settings["teams"]
 _team_names = [t["name"] for t in _teams_cfg]
+
+# Workspace options (id → display label)
+_WORKSPACE_OPTIONS = {
+    "36379689778622": "WS01 (Prod)",
+    "6288329693138990": "WS02 (Non-Prod)",
+}
+_WS_LABELS = list(_WORKSPACE_OPTIONS.values())
+_WS_IDS = list(_WORKSPACE_OPTIONS.keys())
 
 # Restore filter state from URL query params on first load
 if "last_run_tz" not in st.session_state:
@@ -27,20 +37,26 @@ if "last_run_days" not in st.session_state:
     except (ValueError, TypeError):
         st.session_state["last_run_days"] = 30
 
+if "last_run_ws" not in st.session_state:
+    st.session_state["last_run_ws"] = _WS_LABELS[0]  # Default to first (Prod)
+
 def _on_tz_change():
     st.query_params["tz"] = st.session_state["last_run_tz"]
 
 def _on_days_change():
     st.query_params["days"] = str(st.session_state["last_run_days"])
 
-col_tz, col_days, col_teams = st.columns([0.12, 0.63, 0.25])
+col_tz, col_ws, col_days, col_teams = st.columns([0.10, 0.12, 0.53, 0.25])
 selected_tz = col_tz.selectbox(
     "Timezone", options=COMMON_TZ,
     key="last_run_tz", on_change=_on_tz_change,
 )
+selected_ws_label = col_ws.selectbox(
+    "Workspace", options=_WS_LABELS,
+    key="last_run_ws",
+)
 lookback_days = col_days.slider(
     "Lookback days", min_value=1, max_value=60,
-    value=st.session_state["last_run_days"],
     key="last_run_days", on_change=_on_days_change,
 )
 if "last_run_teams" not in st.session_state:
@@ -49,133 +65,188 @@ if "last_run_teams" not in st.session_state:
     _default_team_names = [_id_to_name[tid] for tid in _default_team_ids if tid in _id_to_name]
     st.session_state["last_run_teams"] = [n for n in _default_team_names if n in _team_names]
 selected_teams = col_teams.multiselect(
-    "Teams", options=_team_names, default=st.session_state["last_run_teams"],
+    "Teams", options=_team_names,
     placeholder="All teams", key="last_run_teams",
 )
 
 tz = pytz.timezone(selected_tz)
 now_local = dt.datetime.now(tz)
 
-start_ms = int((now_local - dt.timedelta(days=lookback_days)).timestamp() * 1000)
-end_ms = int(now_local.timestamp() * 1000)
+start_ts = (now_local - dt.timedelta(days=lookback_days)).strftime("%Y-%m-%d %H:%M:%S")
+end_ts = now_local.strftime("%Y-%m-%d %H:%M:%S")
 
 w = make_workspace_client()
 user_w = w
 
+
+# ── SQL execution helper ──────────────────────────────────────────────────────
+
+def _get_warehouse_id(w) -> str:
+    """Get SQL warehouse ID from app resource env var or auto-discover."""
+    wh_id = os.getenv("DATABRICKS_WAREHOUSE_ID")
+    if wh_id:
+        return wh_id
+    # Auto-discover first available warehouse
+    warehouses = list(w.warehouses.list())
+    if not warehouses:
+        st.error("No SQL warehouse available. Add a SQL warehouse resource to the app.")
+        st.stop()
+    return warehouses[0].id
+
+
+def _execute_sql(w, sql: str) -> pd.DataFrame:
+    """Execute SQL via SDK statement execution and return a DataFrame."""
+    warehouse_id = _get_warehouse_id(w)
+    resp = w.statement_execution.execute_statement(
+        warehouse_id=warehouse_id,
+        statement=sql,
+        wait_timeout="50s",
+        disposition=Disposition.INLINE,
+        format=Format.JSON_ARRAY,
+    )
+    if resp.status.state != StatementState.SUCCEEDED:
+        raise RuntimeError(f"SQL query failed: {resp.status.error}")
+    columns = [c.name for c in resp.manifest.schema.columns]
+    rows = resp.result.data_array if resp.result and resp.result.data_array else []
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _parse_timestamp(ts_str, tz):
+    """Parse timestamp string from statement_execution (ISO format with Z suffix)."""
+    ts = pd.Timestamp(ts_str)
+    # Timestamps from statement_execution are already tz-aware (UTC via Z suffix)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    return ts.to_pydatetime().astimezone(tz)
+
+
+# ── Fetch data from system tables ─────────────────────────────────────────────
+
+# Resolve selected workspace label → ID
+workspace_id = _WS_IDS[_WS_LABELS.index(selected_ws_label)]
+
 with st.spinner("Fetching data…"):
     try:
-        completed_runs = list(
-            w.jobs.list_runs(
-                start_time_from=start_ms,
-                start_time_to=end_ms,
-                completed_only=True,
-                expand_tasks=False,
-                run_type=RunType.JOB_RUN,
+        # Get latest job definitions (non-deleted, non-pipeline)
+        df_jobs = _execute_sql(w, f"""
+            WITH ranked AS (
+                SELECT job_id, name, tags, creator_id,
+                       ROW_NUMBER() OVER (PARTITION BY job_id ORDER BY change_time DESC) AS rn
+                FROM maic.silver_system_tables.jobs
+                WHERE workspace_id = '{workspace_id}'
             )
-        )
-    except Exception as e:
-        st.error(f"Failed to fetch runs: {e}")
-        st.stop()
-
-    try:
-        all_jobs = list(w.jobs.list(expand_tasks=True))
+            SELECT job_id, name, tags, creator_id
+            FROM ranked
+            WHERE rn = 1
+        """)
     except Exception as e:
         st.error(f"Failed to fetch job list: {e}")
         st.stop()
 
     try:
-        active_runs = list(w.jobs.list_runs(active_only=True, expand_tasks=False, run_type=RunType.JOB_RUN))
-    except Exception:
-        active_runs = []
+        # Get run history within lookback period (JOB_RUN only)
+        df_runs = _execute_sql(w, f"""
+            SELECT job_id, run_id, period_start_time, period_end_time,
+                   result_state, run_duration_seconds
+            FROM maic.silver_system_tables.job_run_timeline
+            WHERE workspace_id = '{workspace_id}'
+              AND run_type = 'JOB_RUN'
+              AND period_start_time >= TIMESTAMP '{start_ts}'
+              AND period_start_time <= TIMESTAMP '{end_ts}'
+            ORDER BY period_start_time DESC
+        """)
+    except Exception as e:
+        st.error(f"Failed to fetch runs: {e}")
+        st.stop()
 
-# Exclude pipeline jobs (jobs whose tasks include a pipeline_task)
-pipeline_job_ids = {
-    j.job_id
-    for j in all_jobs
-    if j.job_id and j.settings and j.settings.tasks
-    and any(t.pipeline_task is not None for t in j.settings.tasks)
-}
+# Exclude pipeline jobs: identify jobs that have pipeline runs
+# (Pipeline-wrapper jobs typically also trigger SUBMIT_RUN pipeline runs.
+#  If stricter filtering is needed, check job_task_run_timeline for pipeline_task.)
+pipeline_job_ids: set = set()
+# NOTE: If you need pipeline exclusion, add logic here using job_task_run_timeline
+# or filter by job name/tag patterns.
 
-# Registry: job_id → canonical name from job settings (jobs only, no pipelines)
-registry_id_to_name = {
-    j.job_id: (j.settings.name or f"job-{j.job_id}")
-    for j in all_jobs if j.job_id and j.job_id not in pipeline_job_ids
-}
-job_to_id = {name: jid for jid, name in registry_id_to_name.items()}
-
-# Map job name → active run_id (jobs only)
-job_to_running_run_id = {}
-for run in active_runs:
-    if not run.run_id or run.job_id not in registry_id_to_name:
+# Build registry: job_id → job metadata
+registry = {}
+for _, row in df_jobs.iterrows():
+    jid = row["job_id"]
+    if jid in pipeline_job_ids:
         continue
-    name = registry_id_to_name.get(run.job_id)
-    if name not in job_to_running_run_id:
-        job_to_running_run_id[name] = run.run_id
+    # Parse tags from JSON string (system table returns MAP as JSON)
+    tags_raw = row.get("tags")
+    try:
+        tags = json.loads(tags_raw) if tags_raw and tags_raw != "null" else {}
+    except (json.JSONDecodeError, TypeError):
+        tags = {}
+    registry[jid] = {
+        "name": row["name"] or f"job-{jid}",
+        "tags": tags,
+        "creator_id": row.get("creator_id") or "unknown",
+    }
 
-# Build records for completed runs using canonical names
+registry_id_to_name = {jid: meta["name"] for jid, meta in registry.items()}
+job_to_id = {meta["name"]: jid for jid, meta in registry.items()}
+
+# Build records from run data
 records = []
-for run in completed_runs:
-    rs = run.state.result_state.value if run.state and run.state.result_state else None
-    if not rs or not run.start_time or run.job_id not in registry_id_to_name:
+job_to_running_run_id = {}
+
+for _, run in df_runs.iterrows():
+    jid = run["job_id"]
+    if jid not in registry_id_to_name:
         continue
 
-    name = registry_id_to_name[run.job_id]
-    run_start = dt.datetime.fromtimestamp(
-        run.start_time / 1000, tz=pytz.utc
-    ).astimezone(tz)
-    run_end = (
-        dt.datetime.fromtimestamp(run.end_time / 1000, tz=pytz.utc).astimezone(tz)
-        if run.end_time and run.end_time > 0
-        else run_start
-    )
-    duration_min = (run_end - run_start).total_seconds() / 60
+    name = registry_id_to_name[jid]
+    rs = run["result_state"]  # SUCCEEDED, ERROR, CANCELLED, or None/null
 
-    if rs == "SUCCESS":
+    # Parse start time (timestamps arrive as ISO strings with Z suffix, already tz-aware)
+    try:
+        run_start = _parse_timestamp(run["period_start_time"], tz)
+    except Exception:
+        continue
+
+    # Parse end time
+    try:
+        run_end = _parse_timestamp(run["period_end_time"], tz)
+    except Exception:
+        run_end = run_start
+
+    # Duration
+    dur_sec = run.get("run_duration_seconds")
+    try:
+        duration_min = float(dur_sec) / 60 if dur_sec and dur_sec != "null" and dur_sec != "0" else (run_end - run_start).total_seconds() / 60
+    except (ValueError, TypeError):
+        duration_min = (run_end - run_start).total_seconds() / 60
+
+    # Map result_state to display status
+    if rs is None or rs == "" or rs == "null":
+        status = "RUNNING"
+        # Track active runs for stop button
+        if name not in job_to_running_run_id:
+            job_to_running_run_id[name] = run["run_id"]
+    elif rs == "SUCCEEDED":
         status = "SUCCESS"
-    elif rs == "CANCELED":
+    elif rs == "CANCELLED":
         status = "CANCELED"
     else:
         status = "FAILED"
 
-    records.append(
-        {
-            "job": name,
-            "job_id": run.job_id,
-            "run_time": run_start,
-            "duration_min": round(duration_min, 1),
-            "status": status,
-        }
-    )
+    records.append({
+        "job": name,
+        "job_id": jid,
+        "run_time": run_start,
+        "duration_min": round(duration_min, 1),
+        "status": status,
+    })
 
-# Add currently running jobs (so today's cell shows RUNNING)
-for run in active_runs:
-    if not run.start_time or run.job_id not in registry_id_to_name:
-        continue
-    name = registry_id_to_name[run.job_id]
-    run_start = dt.datetime.fromtimestamp(
-        run.start_time / 1000, tz=pytz.utc
-    ).astimezone(tz)
-    elapsed_min = (now_local - run_start).total_seconds() / 60
-    records.append(
-        {
-            "job": name,
-            "job_id": run.job_id,
-            "run_time": run_start,
-            "duration_min": round(elapsed_min, 1),
-            "status": "RUNNING",
-        }
-    )
-
+# Team filtering
 if selected_teams:
     matched_ids = {
-        j.job_id for j in all_jobs
-        if j.job_id and any(
+        jid for jid, meta in registry.items()
+        if any(
             m in selected_teams
             for m in match_team_rules(
-                j.settings.name or f"job-{j.job_id}" if j.settings else f"job-{j.job_id}",
-                getattr(j, "creator_user_name", None) or "unknown",
-                _teams_cfg,
-                tags=j.settings.tags if j.settings else {},
+                meta["name"], meta["creator_id"], _teams_cfg, tags=meta["tags"],
             )
         )
     }
@@ -197,7 +268,7 @@ df_last = (
 # Only jobs that have runs in the period
 job_names = sorted(df_last["job"].unique())
 
-# Full grid: all jobs (from registry) × all days in lookback period
+# Full grid: all jobs × all days in lookback period
 all_dates = pd.date_range(
     end=dt.datetime(now_local.year, now_local.month, now_local.day),
     periods=lookback_days,
@@ -372,7 +443,7 @@ triggered_job = None
 
 _label_html = '<div class="job-labels">' + "".join(
     f'<a href="{job_to_url.get(jname, "#")}" target="_blank" rel="noopener noreferrer" '
-    f'style="color:{label_colors[job_worst.get(jname, "NO RUN")]};" title="{jname}">{jname}</a>'
+    f'style="color:{label_colors[job_worst.get(jname, "NO RUN")]};\" title="{jname}">{jname}</a>'
     for jname in job_names
 ) + "</div>"
 
