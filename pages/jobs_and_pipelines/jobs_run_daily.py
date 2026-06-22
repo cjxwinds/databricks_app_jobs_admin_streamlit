@@ -33,9 +33,15 @@ if "last_run_tz" not in st.session_state:
 
 if "last_run_days" not in st.session_state:
     try:
-        st.session_state["last_run_days"] = max(1, min(60, int(st.query_params.get("days", "30"))))
+        st.session_state["last_run_days"] = max(1, min(365, int(st.query_params.get("days", "30"))))
     except (ValueError, TypeError):
         st.session_state["last_run_days"] = 30
+
+# Initialize synced widget keys from canonical value
+if "_days_slider" not in st.session_state:
+    st.session_state["_days_slider"] = st.session_state["last_run_days"]
+if "_days_input" not in st.session_state:
+    st.session_state["_days_input"] = st.session_state["last_run_days"]
 
 if "last_run_ws" not in st.session_state:
     st.session_state["last_run_ws"] = _WS_LABELS[0]  # Default to first (Prod)
@@ -43,10 +49,18 @@ if "last_run_ws" not in st.session_state:
 def _on_tz_change():
     st.query_params["tz"] = st.session_state["last_run_tz"]
 
-def _on_days_change():
-    st.query_params["days"] = str(st.session_state["last_run_days"])
+def _on_days_slider_change():
+    st.session_state["_days_input"] = st.session_state["_days_slider"]
+    st.session_state["last_run_days"] = st.session_state["_days_slider"]
+    st.query_params["days"] = str(st.session_state["_days_slider"])
 
-col_tz, col_ws, col_days, col_teams = st.columns([0.10, 0.12, 0.53, 0.25])
+def _on_days_input_change():
+    val = max(1, min(365, st.session_state["_days_input"]))
+    st.session_state["_days_slider"] = val
+    st.session_state["last_run_days"] = val
+    st.query_params["days"] = str(val)
+
+col_tz, col_ws, col_days_num, col_days, col_teams = st.columns([0.10, 0.12, 0.08, 0.45, 0.25])
 selected_tz = col_tz.selectbox(
     "Timezone", options=COMMON_TZ,
     key="last_run_tz", on_change=_on_tz_change,
@@ -55,10 +69,16 @@ selected_ws_label = col_ws.selectbox(
     "Workspace", options=_WS_LABELS,
     key="last_run_ws",
 )
-lookback_days = col_days.slider(
-    "Lookback days", min_value=1, max_value=60,
-    key="last_run_days", on_change=_on_days_change,
+col_days_num.number_input(
+    "Days", min_value=1, max_value=365, step=1,
+    key="_days_input", on_change=_on_days_input_change,
 )
+col_days.slider(
+    "Lookback days", min_value=1, max_value=365,
+    key="_days_slider", on_change=_on_days_slider_change,
+)
+lookback_days = st.session_state["last_run_days"]
+
 if "last_run_teams" not in st.session_state:
     _default_team_ids = get_cached_user_prefs(_w_settings).get("default_teams", [])
     _id_to_name = {t["id"]: t["name"] for t in _teams_cfg}
@@ -144,15 +164,29 @@ with st.spinner("Fetching data…"):
         st.stop()
 
     try:
-        # Get run history within lookback period (JOB_RUN only)
+        # Get one row per run_id, preferring the row with a non-null result_state (final state).
+        # job_run_timeline is append-only with multiple period rows per run; intermediate rows
+        # have null result_state and would otherwise show stale "RUNNING" for completed jobs.
         df_runs = _execute_sql(w, f"""
+            WITH run_periods AS (
+                SELECT job_id, run_id, period_start_time, period_end_time,
+                       result_state, run_duration_seconds,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY run_id
+                           ORDER BY
+                               CASE WHEN result_state IS NOT NULL THEN 0 ELSE 1 END,
+                               period_end_time DESC NULLS FIRST
+                       ) AS rn
+                FROM maic.silver_system_tables.job_run_timeline
+                WHERE workspace_id = '{workspace_id}'
+                  AND run_type = 'JOB_RUN'
+                  AND period_start_time >= TIMESTAMP '{start_ts}'
+                  AND period_start_time <= TIMESTAMP '{end_ts}'
+            )
             SELECT job_id, run_id, period_start_time, period_end_time,
                    result_state, run_duration_seconds
-            FROM maic.silver_system_tables.job_run_timeline
-            WHERE workspace_id = '{workspace_id}'
-              AND run_type = 'JOB_RUN'
-              AND period_start_time >= TIMESTAMP '{start_ts}'
-              AND period_start_time <= TIMESTAMP '{end_ts}'
+            FROM run_periods
+            WHERE rn = 1
             ORDER BY period_start_time DESC
         """)
     except Exception as e:
@@ -220,10 +254,18 @@ for _, run in df_runs.iterrows():
 
     # Map result_state to display status
     if rs is None or rs == "" or rs == "null":
-        status = "RUNNING"
-        # Track active runs for stop button
-        if name not in job_to_running_run_id:
-            job_to_running_run_id[name] = run["run_id"]
+        # Only treat as RUNNING if period_end_time is also null (no end recorded yet).
+        # If period_end_time is set, the period has ended but result_state was never written
+        # (stale intermediate record) — classify as FAILED rather than RUNNING.
+        pe = run.get("period_end_time")
+        pe_is_set = pe and pe not in ("", "null") and not (isinstance(pe, float) and pd.isna(pe))
+        if pe_is_set:
+            status = "FAILED"
+        else:
+            status = "RUNNING"
+            # Track active runs for stop button
+            if name not in job_to_running_run_id:
+                job_to_running_run_id[name] = run["run_id"]
     elif rs == "SUCCEEDED":
         status = "SUCCESS"
     elif rs == "CANCELLED":
@@ -259,11 +301,29 @@ if not records:
 df = pd.DataFrame(records)
 df["run_time"] = df["run_time"].apply(lambda x: x.replace(tzinfo=None))
 df["date"] = df["run_time"].dt.normalize()
+
+df_sorted = df.sort_values("run_time")
+
+# Detect (job, date) pairs where a later SUCCESS was preceded by at least one FAILED run
+_prior_fail = (
+    df_sorted.groupby(["job", "date"])
+    .apply(lambda g: (g.sort_values("run_time").iloc[:-1]["status"] == "FAILED").any())
+    .reset_index(name="had_prior_failure")
+)
+
 df_last = (
-    df.sort_values("run_time")
+    df_sorted
     .groupby(["job", "date"], as_index=False)
     .last()
+    .merge(_prior_fail, on=["job", "date"], how="left")
 )
+df_last["had_prior_failure"] = df_last["had_prior_failure"].fillna(False)
+
+# Mark SUCCESS_FIXED where the final run succeeded but at least one earlier run failed on the same date
+df_last.loc[
+    (df_last["status"] == "SUCCESS") & (df_last["had_prior_failure"]),
+    "status"
+] = "SUCCESS_FIXED"
 
 # Only jobs that have runs in the period
 job_names = sorted(df_last["job"].unique())
@@ -286,17 +346,26 @@ df_grid = full_grid.merge(
     how="left",
 ).drop_duplicates(["job", "date"])
 df_grid["status"] = df_grid["status"].fillna("NO RUN")
+# Each job's most recent run time (fallback for NO RUN cells)
+_job_last_run = df_last.groupby("job")["run_time"].max()
+# Format tooltip: show actual run time, or job's latest run for NO RUN cells
+df_grid["last_run_display"] = df_grid.apply(
+    lambda r: r["run_time"].strftime("%Y-%m-%d %H:%M") if pd.notna(r["run_time"])
+    else (_job_last_run[r["job"]].strftime("%Y-%m-%d %H:%M") if r["job"] in _job_last_run.index else ""),
+    axis=1,
+)
 
 status_colors = {
-    "SUCCESS": "#66BB6A",
-    "FAILED": "#EF5350",
-    "CANCELED": "#707070",
-    "RUNNING": "#EFC550",
-    "NO RUN": "#EEEEEE",
+    "SUCCESS":       "#66BB6A",
+    "SUCCESS_FIXED": "#42A5F5",  # Blue — succeeded after a prior failure on the same date
+    "FAILED":        "#EF5350",
+    "CANCELED":      "#707070",
+    "RUNNING":       "#EFC550",
+    "NO RUN":        "#EEEEEE",
 }
 
-# Worst status per job for label coloring (FAILED > CANCELED > RUNNING > SUCCESS > NO RUN)
-_priority = {"FAILED": 0, "CANCELED": 1, "RUNNING": 2, "SUCCESS": 3, "NO RUN": 4}
+# Worst status per job for label coloring (FAILED > CANCELED > RUNNING > SUCCESS_FIXED > SUCCESS > NO RUN)
+_priority = {"FAILED": 0, "CANCELED": 1, "RUNNING": 2, "SUCCESS_FIXED": 3, "SUCCESS": 4, "NO RUN": 5}
 df_worst = (
     df_grid.groupby("job")["status"]
     .agg(lambda s: min(s, key=lambda x: _priority.get(x, 9)))
@@ -305,11 +374,12 @@ df_worst = (
 )
 
 label_colors = {
-    "FAILED":  "#EF5350",
-    "CANCELED": "#707070",
-    "RUNNING":  "#EFC550",
-    "SUCCESS":  "#31333F",
-    "NO RUN":   "#AAAAAA",
+    "FAILED":        "#EF5350",
+    "CANCELED":      "#707070",
+    "RUNNING":       "#EFC550",
+    "SUCCESS_FIXED": "#42A5F5",
+    "SUCCESS":       "#31333F",
+    "NO RUN":        "#AAAAAA",
 }
 
 _ws_host = w.config.host.rstrip("/")
@@ -342,7 +412,7 @@ heatmap = (
         tooltip=[
             "job",
             "status",
-            alt.Tooltip("run_time:T", title="Last Run Time", format="%Y-%m-%d %H:%M"),
+            alt.Tooltip("last_run_display:N", title="Last Run Time"),
             alt.Tooltip("duration_min:Q", title="Duration (min)"),
         ],
     )
@@ -430,7 +500,7 @@ button[data-testid="stBaseButton-secondary"] p {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    padding-right: 4px;
+    padding-right:4px;
 }
 .job-labels a:hover {
     text-decoration: underline;
